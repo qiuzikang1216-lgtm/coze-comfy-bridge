@@ -1,0 +1,15 @@
+{
+  "group_weight": {
+    "hero": 1.0,
+    "lifestyle": 0.95,
+    "detail": 0.9,
+    "usage": 0.88,
+    "angle": 0.86,
+    "feature": 0.84,
+    "advertising": 0.82,
+    "wildcard": 0.8
+  },
+  "success_bonus": 0.2,
+  "priority_factor_divisor": 1000,
+  "formula": "final_score = (success ? success_bonus : 0) + group_weight[shot_group] + priority/priority_factor_divisor"
+}

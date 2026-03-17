@@ -1,0 +1,39 @@
+{
+  "default_ratio": {
+    "hero": "80/20",
+    "lifestyle": "70/30",
+    "detail": "50/50",
+    "usage": "60/40",
+    "angle": "75/25",
+    "feature": "70/30",
+    "advertising": "75/25"
+  },
+  "heuristics": [
+    {
+      "if_main_keywords": [
+        "bag",
+        "backpack",
+        "handbag",
+        "cup",
+        "mug",
+        "candle",
+        "lamp",
+        "shoe"
+      ],
+      "main_role": "main_prod"
+    },
+    {
+      "if_accessory_keywords": [
+        "keychain",
+        "charm",
+        "tag",
+        "strap",
+        "box",
+        "pendant",
+        "ornament"
+      ],
+      "accessory_role": "acc_prod"
+    }
+  ],
+  "notes": "主产品优先占画面更大比例，配件在生活图/细节图中可以适度提升存在感，但不能压过主产品。"
+}

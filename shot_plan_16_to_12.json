@@ -1,0 +1,111 @@
+{
+  "candidate_count": 16,
+  "final_count": 12,
+  "candidate_shots": [
+    {
+      "shot_id": "hero_main",
+      "shot_group": "hero",
+      "purpose": "主图主视觉",
+      "priority": 100
+    },
+    {
+      "shot_id": "hero_alt",
+      "shot_group": "hero",
+      "purpose": "主图备选",
+      "priority": 95
+    },
+    {
+      "shot_id": "life_1",
+      "shot_group": "lifestyle",
+      "purpose": "生活场景1",
+      "priority": 93
+    },
+    {
+      "shot_id": "life_2",
+      "shot_group": "lifestyle",
+      "purpose": "生活场景2",
+      "priority": 92
+    },
+    {
+      "shot_id": "life_3",
+      "shot_group": "lifestyle",
+      "purpose": "生活场景3",
+      "priority": 91
+    },
+    {
+      "shot_id": "life_alt",
+      "shot_group": "lifestyle",
+      "purpose": "生活场景备选",
+      "priority": 89
+    },
+    {
+      "shot_id": "detail_1",
+      "shot_group": "detail",
+      "purpose": "细节图1",
+      "priority": 88
+    },
+    {
+      "shot_id": "detail_2",
+      "shot_group": "detail",
+      "purpose": "细节图2",
+      "priority": 87
+    },
+    {
+      "shot_id": "detail_alt",
+      "shot_group": "detail",
+      "purpose": "细节图备选",
+      "priority": 85
+    },
+    {
+      "shot_id": "usage_1",
+      "shot_group": "usage",
+      "purpose": "使用图1",
+      "priority": 84
+    },
+    {
+      "shot_id": "usage_2",
+      "shot_group": "usage",
+      "purpose": "使用图2",
+      "priority": 83
+    },
+    {
+      "shot_id": "angle_1",
+      "shot_group": "angle",
+      "purpose": "角度图1",
+      "priority": 82
+    },
+    {
+      "shot_id": "angle_2",
+      "shot_group": "angle",
+      "purpose": "角度图2",
+      "priority": 81
+    },
+    {
+      "shot_id": "feature_1",
+      "shot_group": "feature",
+      "purpose": "卖点图",
+      "priority": 80
+    },
+    {
+      "shot_id": "ad_1",
+      "shot_group": "advertising",
+      "purpose": "广告图",
+      "priority": 79
+    },
+    {
+      "shot_id": "wild_1",
+      "shot_group": "wildcard",
+      "purpose": "兜底最佳适配图",
+      "priority": 78
+    }
+  ],
+  "top12_quota": {
+    "hero": 1,
+    "lifestyle": 3,
+    "detail": 2,
+    "usage": 2,
+    "angle": 2,
+    "feature": 1,
+    "advertising": 1
+  }
+}

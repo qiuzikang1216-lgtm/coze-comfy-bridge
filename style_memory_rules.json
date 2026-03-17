@@ -1,0 +1,14 @@
+{
+  "storage_format": "json_text",
+  "fields": [
+    "style_keywords",
+    "scene_preference",
+    "lighting_preference",
+    "props_preference",
+    "selected_shot_groups",
+    "global_style_line"
+  ],
+  "write_timing": "after_success",
+  "read_timing": "before_style_plan",
+  "v1_strategy": "先放 Bridge 或外部存储；后续再升级到平台内长期记忆。"
+}

@@ -1,0 +1,10 @@
+{
+  "default_neg_prompt": "low quality, extra fingers, duplicate object, distorted product, changed product shape, changed color, bad anatomy, cluttered background, cropped product, extra accessories, watermark, text",
+  "etsy_guard": [
+    "clean background",
+    "props <= 3",
+    "main product clear",
+    "warm neutral color preferred",
+    "accessory must not dominate main product"
+  ]
+}
