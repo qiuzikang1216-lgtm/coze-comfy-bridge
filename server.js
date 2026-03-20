@@ -354,7 +354,77 @@ app.post("/run_batch16", async (req, res) => {
     res.status(500).json({ ok:false, error: String(err.message || err) });
   }
 });
+app.post('/detect_profile', async (req, res) => {
+  try {
+    const { img_urls = [], normalized_request = {} } = req.body || {};
 
+    if (!Array.isArray(img_urls) || img_urls.length === 0) {
+      return res.status(400).json({
+        error: 'img_urls must be a non-empty array'
+      });
+    }
+
+    const mainOverride = String(normalized_request.main_prod_override || '').trim();
+    const accOverride = String(normalized_request.accessory_override || '').trim();
+    const ratioOverride = String(normalized_request.ratio_override || '').trim();
+    const scenePref = String(normalized_request.scene_preference || '').trim();
+
+    if (mainOverride) {
+      return res.json({
+        product_profile: {
+          main_prod: mainOverride,
+          acc_prod: accOverride,
+          is_combo: !!accOverride,
+          is_multiview: img_urls.length > 1,
+          prod_cat: '',
+          prod_color: '',
+          prod_mat: '',
+          use_scene: scenePref,
+          ratio_rule: ratioOverride
+        }
+      });
+    }
+
+    const profile = await detectProductProfileFromImages({
+      img_urls,
+      normalized_request
+    });
+
+    return res.json({
+      product_profile: {
+        main_prod: profile.main_prod || '识别不确定',
+        acc_prod: profile.acc_prod || '',
+        is_combo: !!profile.is_combo,
+        is_multiview: typeof profile.is_multiview === 'boolean' ? profile.is_multiview : img_urls.length > 1,
+        prod_cat: profile.prod_cat || '',
+        prod_color: profile.prod_color || '',
+        prod_mat: profile.prod_mat || '',
+        use_scene: profile.use_scene || scenePref || '',
+        ratio_rule: profile.ratio_rule || ratioOverride || ''
+      }
+    });
+  } catch (err) {
+    console.error('[detect_profile] error:', err);
+    return res.status(500).json({
+      error: 'detect_profile failed',
+      detail: String(err?.message || err)
+    });
+  }
+});
+
+async function detectProductProfileFromImages({ img_urls, normalized_request }) {
+  return {
+    main_prod: '识别不确定',
+    acc_prod: '',
+    is_combo: false,
+    is_multiview: img_urls.length > 1,
+    prod_cat: '',
+    prod_color: '',
+    prod_mat: '',
+    use_scene: normalized_request.scene_preference || '',
+    ratio_rule: normalized_request.ratio_override || ''
+  };
+}
 app.listen(PORT, () => {
   console.log(`Bridge listening on :${PORT}`);
 });
