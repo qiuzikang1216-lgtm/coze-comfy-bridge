@@ -63,6 +63,11 @@ function patchWorkflow(workflow, params) {
   return workflow;
 }
 async function downloadUrlToBlob(url) {
+  async function downloadUrlToDataUrl(url) {
+  const { buffer, contentType } = await downloadUrlToBlob(url);
+  const mime = contentType || "image/jpeg";
+  return `data:${mime};base64,${buffer.toString("base64")}`;
+}
   const res = await fetch(url);
   if (!res.ok) throw new Error(`Failed to download input image: HTTP ${res.status}`);
   const buffer = Buffer.from(await res.arrayBuffer());
@@ -485,14 +490,38 @@ async function detectProductProfileFromImages({ img_urls, normalized_request }) 
     `normalized_request=${JSON.stringify(normalized_request || {})}`
   ].join("\n");
 
-  const inputContent = [
-    { type: "input_text", text: instruction },
-    ...safeUrls.map(url => ({
+  const imageInputs = [];
+for (const url of safeUrls) {
+  try {
+    const dataUrl = await downloadUrlToDataUrl(url);
+    imageInputs.push({
       type: "input_image",
-      image_url: url,
+      image_url: dataUrl,
       detail: "high"
-    }))
-  ];
+    });
+  } catch (err) {
+    console.error("[detect_profile] image download failed:", url, err);
+  }
+}
+
+if (!imageInputs.length) {
+  return {
+    main_prod: "识别不确定",
+    acc_prod: "",
+    is_combo: false,
+    is_multiview: false,
+    prod_cat: "",
+    prod_color: "",
+    prod_mat: "",
+    use_scene: scenePref || "",
+    ratio_rule: ratioOverride || ""
+  };
+}
+
+const inputContent = [
+  { type: "input_text", text: instruction },
+  ...imageInputs
+];
 
   const payload = {
     model: OPENAI_VISION_MODEL,
