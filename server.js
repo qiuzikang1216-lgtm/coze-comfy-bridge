@@ -18,6 +18,8 @@ const PORT = Number(process.env.PORT || 3000);
 const BASE_URL = process.env.COMFY_CLOUD_BASE_URL || "https://cloud.comfy.org";
 const API_KEY = process.env.COMFY_CLOUD_API_KEY || "";
 const PARTNER_KEY = process.env.COMFY_PARTNER_API_KEY || "";
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
+const OPENAI_VISION_MODEL = process.env.OPENAI_VISION_MODEL || "gpt-4.1";
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || `http://localhost:${PORT}`;
 const COMFY_CKPT_NAME = process.env.COMFY_CKPT_NAME || "your_model.safetensors";
 const WORKFLOW_TEMPLATE = process.env.WORKFLOW_TEMPLATE || path.join(__dirname, "../comfyui/workflow_api_img2img.json");
@@ -413,17 +415,157 @@ app.post('/detect_profile', async (req, res) => {
 });
 
 async function detectProductProfileFromImages({ img_urls, normalized_request }) {
-  return {
-    main_prod: '识别不确定',
-    acc_prod: '',
-    is_combo: false,
-    is_multiview: img_urls.length > 1,
-    prod_cat: '',
-    prod_color: '',
-    prod_mat: '',
-    use_scene: normalized_request.scene_preference || '',
-    ratio_rule: normalized_request.ratio_override || ''
+  if (!OPENAI_API_KEY) {
+    throw new Error("Missing OPENAI_API_KEY");
+  }
+
+  const safeUrls = (Array.isArray(img_urls) ? img_urls : [])
+    .map(x => String(x || "").trim())
+    .filter(Boolean)
+    .slice(0, 6);
+
+  if (!safeUrls.length) {
+    return {
+      main_prod: "识别不确定",
+      acc_prod: "",
+      is_combo: false,
+      is_multiview: false,
+      prod_cat: "",
+      prod_color: "",
+      prod_mat: "",
+      use_scene: "",
+      ratio_rule: ""
+    };
+  }
+
+  const mainOverride = String(normalized_request?.main_prod_override || "").trim();
+  const accOverride = String(normalized_request?.accessory_override || "").trim();
+  const ratioOverride = String(normalized_request?.ratio_override || "").trim();
+  const scenePref = String(normalized_request?.scene_preference || "").trim();
+
+  const schema = {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      main_prod: { type: "string" },
+      acc_prod: { type: "string" },
+      is_combo: { type: "boolean" },
+      is_multiview: { type: "boolean" },
+      prod_cat: { type: "string" },
+      prod_color: { type: "string" },
+      prod_mat: { type: "string" },
+      use_scene: { type: "string" },
+      ratio_rule: { type: "string" }
+    },
+    required: [
+      "main_prod",
+      "acc_prod",
+      "is_combo",
+      "is_multiview",
+      "prod_cat",
+      "prod_color",
+      "prod_mat",
+      "use_scene",
+      "ratio_rule"
+    ]
   };
+
+  const instruction = [
+    "你是电商商品识别器。",
+    "请综合所有输入图片，识别同一商品的主产品信息，并输出严格符合 JSON Schema 的对象。",
+    "规则：",
+    "1. 这些图片通常是同一商品的多角度图或同一组商品图。",
+    "2. 只要图片里存在商品主体，就必须给出最可能的合理判断，不允许空泛回答。",
+    "3. 如果 main_prod_override 非空，必须直接用它作为 main_prod。",
+    "4. 如果 accessory_override 非空，优先作为 acc_prod。",
+    "5. 如果 ratio_override 非空，优先作为 ratio_rule。",
+    "6. 只有在图片打不开、完全无商品主体、或确实无法识别时，main_prod 才能输出“识别不确定”。",
+    "7. 不允许输出 Schema 之外的字段。",
+    "",
+    `normalized_request=${JSON.stringify(normalized_request || {})}`
+  ].join("\n");
+
+  const inputContent = [
+    { type: "input_text", text: instruction },
+    ...safeUrls.map(url => ({
+      type: "input_image",
+      image_url: url,
+      detail: "high"
+    }))
+  ];
+
+  const payload = {
+    model: OPENAI_VISION_MODEL,
+    input: [
+      {
+        role: "user",
+        content: inputContent
+      }
+    ],
+    text: {
+      format: {
+        type: "json_schema",
+        name: "product_profile",
+        strict: true,
+        schema
+      }
+    },
+    temperature: 0.2,
+    max_output_tokens: 500
+  };
+
+  const res = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${OPENAI_API_KEY}`
+    },
+    body: JSON.stringify(payload)
+  });
+
+  if (!res.ok) {
+    throw new Error(`OpenAI vision failed: HTTP ${res.status} ${await res.text()}`);
+  }
+
+  const data = await res.json();
+
+  const rawText =
+    data.output_text ||
+    data.output?.flatMap(item => item.content || []).find(c => c.type === "output_text")?.text ||
+    "";
+
+  if (!rawText) {
+    throw new Error("OpenAI vision returned empty output_text");
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(rawText);
+  } catch (e) {
+    throw new Error(`OpenAI vision JSON parse failed: ${rawText}`);
+  }
+
+  const result = {
+    main_prod: String(parsed.main_prod || "").trim() || "识别不确定",
+    acc_prod: accOverride || String(parsed.acc_prod || "").trim(),
+    is_combo: typeof parsed.is_combo === "boolean"
+      ? parsed.is_combo
+      : !!(accOverride || String(parsed.acc_prod || "").trim()),
+    is_multiview: typeof parsed.is_multiview === "boolean"
+      ? parsed.is_multiview
+      : safeUrls.length > 1,
+    prod_cat: String(parsed.prod_cat || "").trim(),
+    prod_color: String(parsed.prod_color || "").trim(),
+    prod_mat: String(parsed.prod_mat || "").trim(),
+    use_scene: scenePref || String(parsed.use_scene || "").trim(),
+    ratio_rule: ratioOverride || String(parsed.ratio_rule || "").trim()
+  };
+
+  if (mainOverride) {
+    result.main_prod = mainOverride;
+  }
+
+  return result;
 }
 app.listen(PORT, () => {
   console.log(`Bridge listening on :${PORT}`);
