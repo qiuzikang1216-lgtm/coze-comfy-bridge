@@ -632,6 +632,25 @@ async function detectProductProfileFromImages({ img_urls, normalized_request }) 
 
   return result;
 }
+app.post("/detect_profile", async (req, res) => {
+  try {
+    const { img_urls = [], normalized_request = {} } = req.body || {};
+
+    const product_profile = await detectProductProfileFromImages({
+      img_urls,
+      normalized_request
+    });
+
+    return res.json({ product_profile });
+  } catch (err) {
+    console.error("[detect_profile] error:", err);
+
+    return res.status(500).json({
+      error: "detect_profile_failed",
+      detail: String(err?.message || err)
+    });
+  }
+});
 app.listen(PORT, () => {
   console.log(`Bridge listening on :${PORT}`);
 });
