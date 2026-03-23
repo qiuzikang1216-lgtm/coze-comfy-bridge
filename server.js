@@ -578,7 +578,7 @@ async function detectProductProfileFromImages({ img_urls, normalized_request }) 
 
   console.log("[detect_profile] calling OpenAI vision...");
 
-  const res = await fetch("https://api.openai.com/v1/responses", {
+  const visionRes = await fetch("https://api.openai.com/v1/responses", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -587,11 +587,11 @@ async function detectProductProfileFromImages({ img_urls, normalized_request }) 
     body: JSON.stringify(payload)
   });
 
-  if (!res.ok) {
-    throw new Error(`OPENAI_VISION_FAILED: HTTP ${res.status} ${await res.text()}`);
+  if (!visionRes.ok) {
+    throw new Error(`OPENAI_VISION_FAILED: HTTP ${visionRes.status} ${await visionRes.text()}`);
   }
 
-  const data = await res.json();
+  const data = await visionRes.json();
 
   const rawText =
     data.output_text ||
@@ -632,6 +632,7 @@ async function detectProductProfileFromImages({ img_urls, normalized_request }) 
 
   return result;
 }
+
 app.post("/detect_profile", async (req, res) => {
   try {
     const { img_urls = [], normalized_request = {} } = req.body || {};
@@ -651,6 +652,7 @@ app.post("/detect_profile", async (req, res) => {
     });
   }
 });
+
 app.listen(PORT, () => {
   console.log(`Bridge listening on :${PORT}`);
 });
