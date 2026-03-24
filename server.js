@@ -34,7 +34,7 @@ const PUBLIC_BASE_URL =
     : `http://localhost:${PORT}`);
 
 const COMFY_CKPT_NAME =
-  process.env.COMFY_CKPT_NAME || v2-1768-ema-pruned.safetensors;
+  process.env.COMFY_CKPT_NAME || "v2-1768-ema-pruned.safetensors";
 
 const WORKFLOW_TEMPLATE =
   process.env.WORKFLOW_TEMPLATE ||
