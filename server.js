@@ -34,12 +34,12 @@ const PUBLIC_BASE_URL =
     : `http://localhost:${PORT}`);
 
 const COMFY_CKPT_NAME =
-  process.env.COMFY_CKPT_NAME || "your_model.safetensors";
+  process.env.COMFY_CKPT_NAME || v2-1768-ema-pruned.safetensors;
 
 const WORKFLOW_TEMPLATE =
   process.env.WORKFLOW_TEMPLATE ||
   process.env.WORKFLOW_API_PATH ||
-  path.join(__dirname, "../comfyui/workflow_api_img2img.json");
+  path.join(__dirname, "workflow_api_img2img.json");
 
 const DEFAULT_NEG =
   process.env.DEFAULT_NEG_PROMPT ||
