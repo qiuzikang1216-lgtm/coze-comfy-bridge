@@ -1,6 +1,7 @@
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
+import fsSync from "fs";
 import fs from "fs/promises";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -9,6 +10,24 @@ dotenv.config();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+function resolveImg2ImgWorkflowPath() {
+  const candidates = [
+    path.resolve(process.cwd(), "workflow_api_img2img.json"),
+    path.resolve(__dirname, "workflow_api_img2img.json"),
+    path.resolve(process.cwd(), "comfyui", "workflow_api_img2img.json"),
+    path.resolve(__dirname, "comfyui", "workflow_api_img2img.json"),
+    path.resolve(__dirname, "..", "comfyui", "workflow_api_img2img.json")
+  ];
+
+  for (const p of candidates) {
+    if (fsSync.existsSync(p)) return p;
+  }
+
+  throw new Error(
+    "workflow_api_img2img.json not found, tried: " + candidates.join(" | ")
+  );
+}
 
 const app = express();
 app.use(cors());
@@ -39,7 +58,7 @@ const COMFY_CKPT_NAME =
 const WORKFLOW_TEMPLATE =
   process.env.WORKFLOW_TEMPLATE ||
   process.env.WORKFLOW_API_PATH ||
-  path.join(__dirname, "workflow_api_img2img.json");
+  resolveImg2ImgWorkflowPath();
 
 const DEFAULT_NEG =
   process.env.DEFAULT_NEG_PROMPT ||
@@ -68,7 +87,7 @@ function toSafeString(val) {
 }
 
 function parseMaybeJson(input) {
-  if (!input) return {};
+  if (input === null || input === undefined || input === "") return {};
   if (typeof input === "object") return input;
   if (typeof input !== "string") return {};
   try {
@@ -626,7 +645,8 @@ app.get("/health", async (_req, res) => {
     ok: true,
     service: "coze-comfy-bridge",
     base_url: BASE_URL,
-    vision_model: OPENAI_VISION_MODEL
+    vision_model: OPENAI_VISION_MODEL,
+    workflow_template: WORKFLOW_TEMPLATE
   });
 });
 
@@ -789,4 +809,6 @@ app.post("/detect_profile", async (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`Bridge listening on :${PORT}`);
+  console.log(`[boot] BASE_URL = ${BASE_URL}`);
+  console.log(`[boot] WORKFLOW_TEMPLATE = ${WORKFLOW_TEMPLATE}`);
 });
