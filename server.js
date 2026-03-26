@@ -5,6 +5,7 @@ import fsSync from "fs";
 import fs from "fs/promises";
 import path from "path";
 import { fileURLToPath } from "url";
+import { randomUUID } from "crypto";
 
 dotenv.config();
 
@@ -69,6 +70,15 @@ const DEFAULT_NEG =
   process.env.DEFAULT_NEG_PROMPT ||
   "low quality, extra fingers, duplicate object, distorted product, changed product shape, changed color, bad anatomy, cluttered background, cropped product, extra accessories, watermark, text";
 
+const SINGLE_JOB_TIMEOUT_MS = Number(
+  process.env.SINGLE_JOB_TIMEOUT_MS || 300000
+);
+const BATCH_JOB_TTL_MS = Number(
+  process.env.BATCH_JOB_TTL_MS || 12 * 60 * 60 * 1000
+);
+
+const batch16Jobs = new Map();
+
 function assertEnv() {
   if (!API_KEY) throw new Error("Missing COMFY_CLOUD_API_KEY");
 }
@@ -105,6 +115,27 @@ function parseMaybeJson(input) {
 function normalizeImgUrls(input) {
   if (!Array.isArray(input)) return [];
   return input.map((x) => String(x || "").trim()).filter(Boolean);
+}
+
+function normalizeShotTasks(input) {
+  if (Array.isArray(input)) {
+    return input
+      .map((x) => (typeof x === "object" && x ? x : null))
+      .filter(Boolean);
+  }
+  if (typeof input === "string") {
+    try {
+      const parsed = JSON.parse(input);
+      return Array.isArray(parsed)
+        ? parsed
+            .map((x) => (typeof x === "object" && x ? x : null))
+            .filter(Boolean)
+        : [];
+    } catch {
+      return [];
+    }
+  }
+  return [];
 }
 
 function extractJsonObject(text) {
@@ -218,7 +249,7 @@ async function submitWorkflow(workflow) {
   return data.prompt_id;
 }
 
-async function waitForCompletion(promptId, timeoutMs = 300000) {
+async function waitForCompletion(promptId, timeoutMs = SINGLE_JOB_TIMEOUT_MS) {
   const started = Date.now();
 
   while (Date.now() - started < timeoutMs) {
@@ -275,6 +306,25 @@ function buildProxyUrl(fileInfo) {
   return `${PUBLIC_BASE_URL}/output_proxy?${params.toString()}`;
 }
 
+function getShotGroup(shot_task) {
+  return (
+    shot_task?.shot_group ||
+    shot_task?.group ||
+    shot_task?.shot_type ||
+    "wildcard"
+  );
+}
+
+function getShotGoal(shot_task) {
+  return (
+    shot_task?.shot_goal ||
+    shot_task?.goal ||
+    shot_task?.purpose ||
+    shot_task?.brief ||
+    ""
+  );
+}
+
 function compilePrompt({ product_profile, style_strategy, global_style_line, shot_task }) {
   const parts = [];
 
@@ -287,7 +337,7 @@ function compilePrompt({ product_profile, style_strategy, global_style_line, sho
     parts.push(`with accessory ${accProd}`);
   }
 
-  if (shot_task?.shot_goal) parts.push(shot_task.shot_goal);
+  if (getShotGoal(shot_task)) parts.push(getShotGoal(shot_task));
   if (shot_task?.scene_hint) parts.push(shot_task.scene_hint);
   if (shot_task?.light_hint) parts.push(shot_task.light_hint);
   if (shot_task?.props_hint) parts.push(shot_task.props_hint);
@@ -297,10 +347,15 @@ function compilePrompt({ product_profile, style_strategy, global_style_line, sho
   if (style_strategy?.light_rule) parts.push(style_strategy.light_rule);
   if (style_strategy?.props_rule) parts.push(style_strategy.props_rule);
   if (style_strategy?.comp_rule) parts.push(style_strategy.comp_rule);
+  if (style_strategy?.texture_rule) parts.push(style_strategy.texture_rule);
+  if (style_strategy?.preservation_rule) parts.push(style_strategy.preservation_rule);
   if (global_style_line) parts.push(global_style_line);
 
   parts.push(
     "clean background, product shape preserved, realistic materials, hasselblad-like commercial realism"
+  );
+  parts.push(
+    "keep the product exactly 1:1 based on reference images, do not change structure, proportion, material, color, carving details, or add extra accessories"
   );
 
   return parts.filter(Boolean).join(", ");
@@ -318,7 +373,8 @@ function scoreItem({ shot_task, success }) {
     wildcard: 0.8
   };
 
-  const w = groupWeight[shot_task?.shot_group] || 0.8;
+  const shotGroup = getShotGroup(shot_task);
+  const w = groupWeight[shotGroup] || 0.8;
   const priority = Number(shot_task?.priority || 0);
   const successBonus = success ? 0.2 : 0;
   const finalScore = successBonus + w + priority / 1000;
@@ -398,6 +454,20 @@ function extractImgUrls(body) {
   return [];
 }
 
+function pickImgUrlForShot(imgUrls, shot, index) {
+  const refIndex =
+    Number.isInteger(shot?.reference_index)
+      ? shot.reference_index
+      : Number.isInteger(shot?.img_index)
+      ? shot.img_index
+      : Number.isInteger(shot?.ref_index)
+      ? shot.ref_index
+      : index;
+
+  const safeIndex = Math.max(0, Math.min(refIndex, imgUrls.length - 1));
+  return imgUrls[safeIndex] || imgUrls[0];
+}
+
 async function generateOneInternal(body) {
   assertEnv();
 
@@ -442,7 +512,10 @@ async function generateOneInternal(body) {
       image_url: "",
       shot_id: body.shot_id,
       shot_group: body.shot_group,
-      ...scoreItem({ shot_task: { shot_group: body.shot_group, priority: 0 }, success: false }),
+      ...scoreItem({
+        shot_task: { shot_group: body.shot_group, priority: body.priority || 0 },
+        success: false
+      }),
       fail_reason: "No image output found",
       prompt_text: body.prompt_text
     };
@@ -452,12 +525,166 @@ async function generateOneInternal(body) {
     image_url: buildProxyUrl(fileInfo),
     shot_id: body.shot_id,
     shot_group: body.shot_group,
-    ...scoreItem({ shot_task: { shot_group: body.shot_group, priority: 0 }, success: true }),
+    ...scoreItem({
+      shot_task: { shot_group: body.shot_group, priority: body.priority || 0 },
+      success: true
+    }),
     fail_reason: "",
     prompt_text: body.prompt_text,
     file_info: fileInfo
   };
 }
+
+function buildSummaryText(items, top12_items) {
+  return `已生成 ${items.length} 张候选图，筛选出 ${top12_items.length} 张结果。`;
+}
+
+async function runBatch16Internal(body, jobId) {
+  const safeBody = parseMaybeJson(body);
+  const shotTasks = normalizeShotTasks(safeBody.shot_tasks);
+  const imgUrls = extractImgUrls(safeBody);
+
+  if (!imgUrls.length) {
+    throw new Error("img_urls or img_inputs is required");
+  }
+
+  if (!shotTasks.length) {
+    throw new Error("shot_tasks is required");
+  }
+
+  const items = [];
+  const baseSeed = Number(safeBody.seed || 1);
+
+  setJob(jobId, {
+    status: "running",
+    progress_total: shotTasks.length,
+    progress_done: 0,
+    progress_text: "batch started"
+  });
+
+  for (let i = 0; i < shotTasks.length; i++) {
+    const shot = shotTasks[i];
+
+    const promptText =
+      toSafeString(shot?.prompt_text) ||
+      compilePrompt({
+        product_profile: safeBody.product_profile || {},
+        style_strategy: safeBody.style_strategy || {},
+        global_style_line: safeBody.global_style_line || "",
+        shot_task: shot
+      });
+
+    const negPrompt =
+      toSafeString(shot?.neg_prompt) ||
+      toSafeString(safeBody.neg_prompt) ||
+      DEFAULT_NEG;
+
+    const shotId = shot?.shot_id || `shot_${i + 1}`;
+    const shotGroup = getShotGroup(shot);
+    const shotGoal = getShotGoal(shot);
+    const priority = Number(shot?.priority || 0);
+
+    const singleImgUrl = pickImgUrlForShot(imgUrls, shot, i);
+
+    setJob(jobId, {
+      status: "running",
+      progress_total: shotTasks.length,
+      progress_done: i,
+      progress_text: `running ${shotId}`
+    });
+
+    try {
+      const item = await generateOneInternal({
+        img_urls: [singleImgUrl],
+        prompt_text: promptText,
+        neg_prompt: negPrompt,
+        shot_id: shotId,
+        shot_group: shotGroup,
+        steps: shot?.steps ?? safeBody.steps ?? 24,
+        cfg: shot?.cfg ?? safeBody.cfg ?? 6.5,
+        denoise: shot?.denoise ?? safeBody.denoise ?? 0.55,
+        seed: shot?.seed ?? (baseSeed + i),
+        ckpt_name: shot?.ckpt_name ?? safeBody.ckpt_name,
+        priority
+      });
+
+      const score = scoreItem({
+        shot_task: shot,
+        success: !item.fail_reason
+      });
+
+      items.push({
+        ...item,
+        ...score,
+        shot_goal: shotGoal,
+        priority
+      });
+    } catch (err) {
+      const score = scoreItem({ shot_task: shot, success: false });
+
+      items.push({
+        image_url: "",
+        shot_id: shotId,
+        shot_group: shotGroup,
+        ...score,
+        fail_reason: String(err?.message || err),
+        prompt_text: promptText,
+        shot_goal: shotGoal,
+        priority
+      });
+    }
+
+    setJob(jobId, {
+      status: "running",
+      progress_total: shotTasks.length,
+      progress_done: i + 1,
+      progress_text: `done ${shotId}`
+    });
+  }
+
+  const { top12_items, drop4_items } = pickTop12(
+    items,
+    Number(safeBody.final_count || 12)
+  );
+
+  const summary_text = buildSummaryText(items, top12_items);
+
+  return {
+    items,
+    top12_items,
+    drop4_items,
+    summary_text,
+    product_profile: safeBody.product_profile || {}
+  };
+}
+
+function makeJobId() {
+  return `job_${Date.now()}_${randomUUID().slice(0, 8)}`;
+}
+
+function setJob(jobId, patch) {
+  const prev = batch16Jobs.get(jobId) || {};
+  const next = {
+    ...prev,
+    ...patch,
+    updated_at: new Date().toISOString(),
+    updated_at_ms: Date.now()
+  };
+  batch16Jobs.set(jobId, next);
+  return next;
+}
+
+function cleanupOldJobs() {
+  const now = Date.now();
+  for (const [jobId, job] of batch16Jobs.entries()) {
+    const updatedAtMs = Number(job?.updated_at_ms || 0);
+    if (updatedAtMs && now - updatedAtMs > BATCH_JOB_TTL_MS) {
+      batch16Jobs.delete(jobId);
+    }
+  }
+}
+
+setInterval(cleanupOldJobs, 10 * 60 * 1000).unref();
 
 async function detectProductProfileFromImages({ img_urls, normalized_request }) {
   if (!OPENAI_API_KEY) {
@@ -712,79 +939,143 @@ app.post("/run_batch16", async (req, res) => {
     assertEnv();
 
     const body = parseMaybeJson(req.body);
-    const shotTasks = Array.isArray(body.shot_tasks) ? body.shot_tasks : [];
+    const shotTasks = normalizeShotTasks(body.shot_tasks);
     const imgUrls = extractImgUrls(body);
 
     if (!imgUrls.length) {
-      return res.status(400).json({ ok: false, error: "img_urls or img_inputs is required" });
+      return res.status(400).json({
+        ok: false,
+        error: "img_urls or img_inputs is required"
+      });
     }
 
     if (!shotTasks.length) {
-      return res.status(400).json({ ok: false, error: "shot_tasks is required" });
+      return res.status(400).json({
+        ok: false,
+        error: "shot_tasks is required"
+      });
     }
 
-    const items = [];
-    const baseSeed = Number(body.seed || 1);
+    const jobId = makeJobId();
 
-    for (let i = 0; i < shotTasks.length; i++) {
-      const shot = shotTasks[i];
+    setJob(jobId, {
+      ok: true,
+      job_id: jobId,
+      status: "queued",
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+      updated_at_ms: Date.now(),
+      progress_total: shotTasks.length,
+      progress_done: 0,
+      progress_text: "queued",
+      items: [],
+      top12_items: [],
+      drop4_items: [],
+      summary_text: "",
+      product_profile: body.product_profile || {},
+      error: ""
+    });
 
-      const promptText = compilePrompt({
-        product_profile: body.product_profile || {},
-        style_strategy: body.style_strategy || {},
-        global_style_line: body.global_style_line || "",
-        shot_task: shot
-      });
+    res.status(202).json({
+      ok: true,
+      job_id: jobId,
+      status: "queued"
+    });
 
+    setImmediate(async () => {
       try {
-        const item = await generateOneInternal({
-          img_urls: imgUrls,
-          prompt_text: promptText,
-          neg_prompt: body.neg_prompt || DEFAULT_NEG,
-          shot_id: shot.shot_id || `shot_${i + 1}`,
-          shot_group: shot.shot_group || "wildcard",
-          steps: body.steps || 24,
-          cfg: body.cfg || 6.5,
-          denoise: body.denoise || 0.55,
-          seed: baseSeed + i,
-          ckpt_name: body.ckpt_name
+        setJob(jobId, {
+          status: "running",
+          progress_text: "starting"
         });
 
-        const score = scoreItem({
-          shot_task: shot,
-          success: !item.fail_reason
-        });
+        const result = await runBatch16Internal(body, jobId);
 
-        items.push({
-          ...item,
-          ...score,
-          shot_goal: shot.shot_goal || "",
-          priority: shot.priority || 0
+        setJob(jobId, {
+          ok: true,
+          status: "done",
+          progress_done: shotTasks.length,
+          progress_total: shotTasks.length,
+          progress_text: "done",
+          items: result.items,
+          top12_items: result.top12_items,
+          drop4_items: result.drop4_items,
+          summary_text: result.summary_text,
+          product_profile: result.product_profile || body.product_profile || {},
+          error: ""
         });
       } catch (err) {
-        const score = scoreItem({ shot_task: shot, success: false });
-
-        items.push({
-          image_url: "",
-          shot_id: shot.shot_id || `shot_${i + 1}`,
-          shot_group: shot.shot_group || "wildcard",
-          ...score,
-          fail_reason: String(err.message || err),
-          prompt_text: promptText,
-          shot_goal: shot.shot_goal || "",
-          priority: shot.priority || 0
+        setJob(jobId, {
+          ok: false,
+          status: "failed",
+          progress_text: "failed",
+          error: String(err?.message || err)
         });
       }
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: String(err.message || err) });
+  }
+});
+
+app.get("/run_batch16_status", async (req, res) => {
+  try {
+    const jobId = toSafeString(req.query.job_id);
+
+    if (!jobId) {
+      return res.status(400).json({
+        ok: false,
+        error: "job_id is required"
+      });
     }
 
-    const { top12_items, drop4_items } = pickTop12(
-      items,
-      Number(body.final_count || 12)
-    );
+    cleanupOldJobs();
 
-    const summary_text = `已生成 ${items.length} 张候选图，筛选出 ${top12_items.length} 张结果。`;
+    const job = batch16Jobs.get(jobId);
+    if (!job) {
+      return res.status(404).json({
+        ok: false,
+        error: "job not found",
+        job_id: jobId
+      });
+    }
 
-    res.json({ items, top12_items, drop4_items, summary_text });
+    if (job.status === "done") {
+      return res.json({
+        ok: true,
+        job_id: jobId,
+        status: "done",
+        progress_done: Number(job.progress_done || 0),
+        progress_total: Number(job.progress_total || 0),
+        progress_text: job.progress_text || "",
+        items: Array.isArray(job.items) ? job.items : [],
+        top12_items: Array.isArray(job.top12_items) ? job.top12_items : [],
+        drop4_items: Array.isArray(job.drop4_items) ? job.drop4_items : [],
+        summary_text: job.summary_text || "",
+        product_profile: job.product_profile || {}
+      });
+    }
+
+    if (job.status === "failed") {
+      return res.json({
+        ok: false,
+        job_id: jobId,
+        status: "failed",
+        progress_done: Number(job.progress_done || 0),
+        progress_total: Number(job.progress_total || 0),
+        progress_text: job.progress_text || "",
+        error: job.error || "unknown error"
+      });
+    }
+
+    return res.json({
+      ok: true,
+      job_id: jobId,
+      status: job.status || "queued",
+      progress_done: Number(job.progress_done || 0),
+      progress_total: Number(job.progress_total || 0),
+      progress_text: job.progress_text || ""
+    });
   } catch (err) {
     res.status(500).json({ ok: false, error: String(err.message || err) });
   }
