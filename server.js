@@ -12,6 +12,24 @@ dotenv.config();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function stageLog(event, data = {}) {
+  try {
+    const payload = {
+      tag: "run_batch16",
+      event,
+      time: nowIso(),
+      ...data
+    };
+    console.log(JSON.stringify(payload));
+  } catch (e) {
+    console.log("[run_batch16][log_error]", e?.message || String(e));
+  }
+}
+
 function resolveImg2ImgWorkflowPath() {
   const envCandidates = [
     process.env.WORKFLOW_TEMPLATE,
@@ -249,61 +267,159 @@ async function submitWorkflow(workflow) {
   return data.prompt_id;
 }
 
-async function waitForCompletion(promptId, timeoutMs = SINGLE_JOB_TIMEOUT_MS) {
-  const started = Date.now();
+function makeJobId() {
+  return `job_${Date.now()}_${randomUUID().slice(0, 8)}`;
+}
 
-  while (Date.now() - started < timeoutMs) {
-    const res = await fetch(`${BASE_URL}/api/job/${promptId}/status`, {
-      headers: getHeaders(false)
-    });
+function setJob(jobId, patch) {
+  const prev = batch16Jobs.get(jobId) || {};
+  const next = {
+    ...prev,
+    ...patch,
+    updated_at: nowIso(),
+    updated_at_ms: Date.now()
+  };
+  batch16Jobs.set(jobId, next);
+  return next;
+}
 
-    if (!res.ok) {
-      throw new Error(`Status failed: HTTP ${res.status}`);
+function getJob(jobId) {
+  return batch16Jobs.get(jobId) || null;
+}
+
+function bumpJob(jobId, deltas = {}) {
+  const prev = batch16Jobs.get(jobId) || {};
+  const patch = {};
+  for (const [key, delta] of Object.entries(deltas)) {
+    patch[key] = Number(prev[key] || 0) + Number(delta || 0);
+  }
+  return setJob(jobId, patch);
+}
+
+function cleanupOldJobs() {
+  const now = Date.now();
+  for (const [jobId, job] of batch16Jobs.entries()) {
+    const updatedAtMs = Number(job?.updated_at_ms || 0);
+    if (updatedAtMs && now - updatedAtMs > BATCH_JOB_TTL_MS) {
+      batch16Jobs.delete(jobId);
     }
-
-    const data = await res.json();
-    const status = data.status;
-
-    if (status === "completed") return true;
-    if (status === "failed" || status === "cancelled") {
-      throw new Error(`Job ${status}`);
-    }
-
-    await sleep(2000);
   }
-
-  throw new Error("Job timeout");
 }
 
-async function fetchOutputs(promptId) {
-  const res = await fetch(`${BASE_URL}/api/history_v2/${promptId}`, {
-    headers: getHeaders(false)
+setInterval(cleanupOldJobs, 10 * 60 * 1000).unref();
+
+function touchItem(item, patch = {}) {
+  if (!item) return item;
+  Object.assign(item, patch, {
+    updated_at: nowIso()
   });
-
-  if (!res.ok) {
-    throw new Error(`History failed: HTTP ${res.status}`);
-  }
-
-  const data = await res.json();
-  return data.outputs || {};
+  return item;
 }
 
-function firstImageFile(outputs) {
-  for (const nodeOutputs of Object.values(outputs || {})) {
-    const images = nodeOutputs?.images || [];
-    if (images.length) return images[0];
-  }
-  return null;
-}
-
-function buildProxyUrl(fileInfo) {
-  const params = new URLSearchParams({
-    filename: fileInfo.filename,
-    subfolder: fileInfo.subfolder || "",
-    type: fileInfo.type || "output"
+function finishItem(item, patch = {}) {
+  if (!item) return item;
+  const finishedAt = nowIso();
+  const startMs = item.started_at ? new Date(item.started_at).getTime() : Date.now();
+  Object.assign(item, patch, {
+    updated_at: finishedAt,
+    finished_at: finishedAt,
+    duration_ms: Math.max(0, Date.now() - startMs)
   });
+  return item;
+}
 
-  return `${PUBLIC_BASE_URL}/output_proxy?${params.toString()}`;
+function createBatchItem(shot, index) {
+  const shotId = shot?.shot_id || `shot_${String(index + 1).padStart(3, "0")}`;
+  return {
+    image_url: "",
+    shot_id: shotId,
+    shot_group: getShotGroup(shot),
+    qc_score: 0,
+    comp_score: 0,
+    etsy_score: 0,
+    final_score: 0,
+    fail_reason: "",
+    prompt_text: "",
+    shot_goal: getShotGoal(shot),
+    priority: Number(shot?.priority || 0),
+
+    stage: "created",
+    stage_message: "job item created",
+    comfy_job_id: "",
+    output_fetch_ok: false,
+    proxy_write_ok: false,
+    duration_ms: 0,
+    started_at: nowIso(),
+    finished_at: "",
+    updated_at: nowIso(),
+
+    _src_index: index
+  };
+}
+
+function serializeItem(item) {
+  return {
+    image_url: item?.image_url || "",
+    shot_id: item?.shot_id || "",
+    shot_group: item?.shot_group || "",
+    qc_score: Number(item?.qc_score || 0),
+    comp_score: Number(item?.comp_score || 0),
+    etsy_score: Number(item?.etsy_score || 0),
+    final_score: Number(item?.final_score || 0),
+    fail_reason: item?.fail_reason || "",
+    prompt_text: item?.prompt_text || "",
+    shot_goal: item?.shot_goal || "",
+    priority: Number(item?.priority || 0),
+
+    stage: item?.stage || "",
+    stage_message: item?.stage_message || "",
+    comfy_job_id: item?.comfy_job_id || "",
+    output_fetch_ok: !!item?.output_fetch_ok,
+    proxy_write_ok: !!item?.proxy_write_ok,
+    duration_ms: Number(item?.duration_ms || 0),
+    started_at: item?.started_at || "",
+    finished_at: item?.finished_at || "",
+    updated_at: item?.updated_at || "",
+
+    _src_index: Number(item?._src_index ?? -1),
+    file_info: item?.file_info || null
+  };
+}
+
+function serializeJob(jobId, job) {
+  return {
+    ok: job?.status !== "failed",
+    job_id: jobId,
+    status: job?.status || "queued",
+    bridge_stage: job?.bridge_stage || "",
+    created_at: job?.created_at || "",
+    updated_at: job?.updated_at || "",
+    batch_started_at: job?.batch_started_at || "",
+    batch_finished_at: job?.batch_finished_at || "",
+    batch_duration_ms: Number(job?.batch_duration_ms || 0),
+
+    progress_done: Number(job?.progress_done || 0),
+    progress_total: Number(job?.progress_total || 0),
+    progress_text: job?.progress_text || "",
+
+    submit_count: Number(job?.submit_count || 0),
+    success_count: Number(job?.success_count || 0),
+    failed_count: Number(job?.failed_count || 0),
+    timeout_count: Number(job?.timeout_count || 0),
+    last_error_code: job?.last_error_code || "",
+    last_error_message: job?.last_error_message || "",
+    error: job?.error || "",
+
+    items: Array.isArray(job?.items) ? job.items.map(serializeItem) : [],
+    top12_items: Array.isArray(job?.top12_items)
+      ? job.top12_items.map(serializeItem)
+      : [],
+    drop4_items: Array.isArray(job?.drop4_items)
+      ? job.drop4_items.map(serializeItem)
+      : [],
+    summary_text: job?.summary_text || "",
+    product_profile: job?.product_profile || {}
+  };
 }
 
 function getShotGroup(shot_task) {
@@ -468,13 +584,130 @@ function pickImgUrlForShot(imgUrls, shot, index) {
   return imgUrls[safeIndex] || imgUrls[0];
 }
 
-async function generateOneInternal(body) {
+async function waitForCompletion(promptId, timeoutMs = SINGLE_JOB_TIMEOUT_MS, ctx = {}) {
+  const started = Date.now();
+  const jobId = ctx.jobId || "";
+  const item = ctx.item || null;
+  let lastState = "";
+
+  while (Date.now() - started < timeoutMs) {
+    const res = await fetch(`${BASE_URL}/api/job/${promptId}/status`, {
+      headers: getHeaders(false)
+    });
+
+    if (!res.ok) {
+      throw new Error(`Status failed: HTTP ${res.status}`);
+    }
+
+    const data = await res.json();
+    const status = String(data.status || "").toLowerCase();
+
+    if (status && status !== lastState) {
+      lastState = status;
+      if (item) {
+        touchItem(item, {
+          stage: "polling",
+          stage_message: `poll_state=${status}`
+        });
+      }
+      if (jobId) setJob(jobId, {});
+      stageLog("poll_state", {
+        job_id: jobId,
+        shot_id: item?.shot_id || "",
+        comfy_job_id: item?.comfy_job_id || promptId,
+        state: status
+      });
+    }
+
+    if (status === "completed") return true;
+
+    if (status === "failed" || status === "cancelled") {
+      if (item) {
+        touchItem(item, {
+          stage: "poll_failed",
+          stage_message: `job ${status}`,
+          fail_reason: `Job ${status}`
+        });
+      }
+      throw new Error(`Job ${status}`);
+    }
+
+    await sleep(2000);
+  }
+
+  if (item) {
+    finishItem(item, {
+      stage: "timeout",
+      stage_message: "job timeout",
+      fail_reason: "Job timeout"
+    });
+  }
+
+  stageLog("timeout", {
+    job_id: jobId,
+    shot_id: item?.shot_id || "",
+    comfy_job_id: item?.comfy_job_id || promptId,
+    stage: item?.stage || "timeout",
+    duration_ms: Number(item?.duration_ms || Date.now() - started)
+  });
+
+  throw new Error("Job timeout");
+}
+
+async function fetchOutputs(promptId) {
+  const res = await fetch(`${BASE_URL}/api/history_v2/${promptId}`, {
+    headers: getHeaders(false)
+  });
+
+  if (!res.ok) {
+    throw new Error(`History failed: HTTP ${res.status}`);
+  }
+
+  const data = await res.json();
+  return data.outputs || {};
+}
+
+function firstImageFile(outputs) {
+  for (const nodeOutputs of Object.values(outputs || {})) {
+    const images = nodeOutputs?.images || [];
+    if (images.length) return images[0];
+  }
+  return null;
+}
+
+function buildProxyUrl(fileInfo) {
+  const params = new URLSearchParams({
+    filename: fileInfo.filename,
+    subfolder: fileInfo.subfolder || "",
+    type: fileInfo.type || "output"
+  });
+
+  return `${PUBLIC_BASE_URL}/output_proxy?${params.toString()}`;
+}
+
+async function generateOneInternal(body, ctx = {}) {
   assertEnv();
+
+  const jobId = ctx.jobId || "";
+  const item = ctx.item || null;
+  const shotId = body?.shot_id || item?.shot_id || "";
 
   const imgUrls = extractImgUrls(body);
   if (!imgUrls.length) {
     throw new Error("img_urls is empty");
   }
+
+  if (item) {
+    touchItem(item, {
+      stage: "upload_begin",
+      stage_message: "uploading input image"
+    });
+  }
+  if (jobId) setJob(jobId, {});
+  stageLog("upload_begin", {
+    job_id: jobId,
+    shot_id: shotId
+  });
 
   const uploaded = await uploadInputImage(imgUrls[0]);
   const inputName =
@@ -487,6 +720,19 @@ async function generateOneInternal(body) {
   if (!inputName) {
     throw new Error("Upload response does not contain uploaded filename");
   }
+
+  if (item) {
+    touchItem(item, {
+      stage: "upload_ok",
+      stage_message: "input image uploaded"
+    });
+  }
+  if (jobId) setJob(jobId, {});
+  stageLog("upload_ok", {
+    job_id: jobId,
+    shot_id: shotId,
+    uploaded_name: inputName
+  });
 
   let workflow = await loadWorkflowTemplate();
   workflow = patchWorkflow(workflow, {
@@ -501,34 +747,120 @@ async function generateOneInternal(body) {
     ckpt_name: body.ckpt_name
   });
 
+  if (item) {
+    touchItem(item, {
+      stage: "submit_begin",
+      stage_message: "submitting workflow to comfy"
+    });
+  }
+  if (jobId) setJob(jobId, {});
+  stageLog("submit_begin", {
+    job_id: jobId,
+    shot_id: shotId
+  });
+
   const promptId = await submitWorkflow(workflow);
-  await waitForCompletion(promptId);
+
+  if (item) {
+    touchItem(item, {
+      comfy_job_id: promptId || "",
+      stage: "submitted",
+      stage_message: "submitted to comfy"
+    });
+  }
+  if (jobId) {
+    bumpJob(jobId, { submit_count: 1 });
+  }
+  stageLog("submit_ok", {
+    job_id: jobId,
+    shot_id: shotId,
+    comfy_job_id: promptId
+  });
+
+  await waitForCompletion(promptId, SINGLE_JOB_TIMEOUT_MS, {
+    jobId,
+    item
+  });
+
+  if (item) {
+    touchItem(item, {
+      stage: "output_fetch_begin",
+      stage_message: "fetching comfy output"
+    });
+  }
+  if (jobId) setJob(jobId, {});
+  stageLog("output_fetch_begin", {
+    job_id: jobId,
+    shot_id: shotId,
+    comfy_job_id: promptId
+  });
 
   const outputs = await fetchOutputs(promptId);
   const fileInfo = firstImageFile(outputs);
+
+  if (item) {
+    touchItem(item, {
+      output_fetch_ok: true,
+      stage: "output_fetch_ok",
+      stage_message: fileInfo ? "comfy output fetched" : "no image output found"
+    });
+  }
+  if (jobId) setJob(jobId, {});
+  stageLog("output_fetch_ok", {
+    job_id: jobId,
+    shot_id: shotId,
+    comfy_job_id: promptId,
+    has_output: !!fileInfo
+  });
 
   if (!fileInfo) {
     return {
       image_url: "",
       shot_id: body.shot_id,
       shot_group: body.shot_group,
-      ...scoreItem({
-        shot_task: { shot_group: body.shot_group, priority: body.priority || 0 },
-        success: false
-      }),
       fail_reason: "No image output found",
-      prompt_text: body.prompt_text
+      prompt_text: body.prompt_text,
+      file_info: null
     };
   }
 
+  if (item) {
+    touchItem(item, {
+      stage: "image_url_write_begin",
+      stage_message: "writing image_url"
+    });
+  }
+  if (jobId) setJob(jobId, {});
+  stageLog("image_url_write_begin", {
+    job_id: jobId,
+    shot_id: shotId
+  });
+
+  const imageUrl = buildProxyUrl(fileInfo);
+
+  if (item) {
+    touchItem(item, {
+      image_url: imageUrl,
+      proxy_write_ok: !!imageUrl,
+      stage: "completed",
+      stage_message: imageUrl ? "image_url written" : "image_url empty"
+    });
+    finishItem(item, {
+      fail_reason: "",
+      file_info: fileInfo
+    });
+  }
+  if (jobId) setJob(jobId, {});
+  stageLog("image_url_write_ok", {
+    job_id: jobId,
+    shot_id: shotId,
+    image_url: imageUrl
+  });
+
   return {
-    image_url: buildProxyUrl(fileInfo),
+    image_url: imageUrl,
     shot_id: body.shot_id,
     shot_group: body.shot_group,
-    ...scoreItem({
-      shot_task: { shot_group: body.shot_group, priority: body.priority || 0 },
-      success: true
-    }),
     fail_reason: "",
     prompt_text: body.prompt_text,
     file_info: fileInfo
@@ -552,18 +884,24 @@ async function runBatch16Internal(body, jobId) {
     throw new Error("shot_tasks is required");
   }
 
-  const items = [];
+  const items = shotTasks.map((shot, index) => createBatchItem(shot, index));
   const baseSeed = Number(safeBody.seed || 1);
 
   setJob(jobId, {
     status: "running",
+    bridge_stage: "batch_started",
     progress_total: shotTasks.length,
     progress_done: 0,
-    progress_text: "batch started"
+    progress_text: "batch started",
+    items,
+    top12_items: [],
+    drop4_items: [],
+    summary_text: ""
   });
 
   for (let i = 0; i < shotTasks.length; i++) {
     const shot = shotTasks[i];
+    const item = items[i];
 
     const promptText =
       toSafeString(shot?.prompt_text) ||
@@ -579,66 +917,125 @@ async function runBatch16Internal(body, jobId) {
       toSafeString(safeBody.neg_prompt) ||
       DEFAULT_NEG;
 
-    const shotId = shot?.shot_id || `shot_${i + 1}`;
-    const shotGroup = getShotGroup(shot);
-    const shotGoal = getShotGoal(shot);
-    const priority = Number(shot?.priority || 0);
+    const shotId = item.shot_id;
+    const shotGroup = item.shot_group;
+    const shotGoal = item.shot_goal;
+    const priority = item.priority;
 
     const singleImgUrl = pickImgUrlForShot(imgUrls, shot, i);
 
+    touchItem(item, {
+      prompt_text: promptText,
+      shot_goal: shotGoal,
+      priority,
+      stage: "prepared",
+      stage_message: `prepared ${shotId}`
+    });
+
     setJob(jobId, {
       status: "running",
+      bridge_stage: "batch_running",
       progress_total: shotTasks.length,
       progress_done: i,
-      progress_text: `running ${shotId}`
+      progress_text: `running ${shotId}`,
+      items
     });
 
     try {
-      const item = await generateOneInternal({
-        img_urls: [singleImgUrl],
-        prompt_text: promptText,
-        neg_prompt: negPrompt,
-        shot_id: shotId,
-        shot_group: shotGroup,
-        steps: shot?.steps ?? safeBody.steps ?? 24,
-        cfg: shot?.cfg ?? safeBody.cfg ?? 6.5,
-        denoise: shot?.denoise ?? safeBody.denoise ?? 0.55,
-        seed: shot?.seed ?? (baseSeed + i),
-        ckpt_name: shot?.ckpt_name ?? safeBody.ckpt_name,
-        priority
-      });
+      const result = await generateOneInternal(
+        {
+          img_urls: [singleImgUrl],
+          prompt_text: promptText,
+          neg_prompt: negPrompt,
+          shot_id: shotId,
+          shot_group: shotGroup,
+          steps: shot?.steps ?? safeBody.steps ?? 24,
+          cfg: shot?.cfg ?? safeBody.cfg ?? 6.5,
+          denoise: shot?.denoise ?? safeBody.denoise ?? 0.55,
+          seed: shot?.seed ?? (baseSeed + i),
+          ckpt_name: shot?.ckpt_name ?? safeBody.ckpt_name,
+          priority
+        },
+        { jobId, item }
+      );
 
       const score = scoreItem({
         shot_task: shot,
-        success: !item.fail_reason
+        success: !result.fail_reason
       });
 
-      items.push({
-        ...item,
+      Object.assign(item, {
+        ...result,
         ...score,
         shot_goal: shotGoal,
-        priority
+        priority,
+        shot_group: shotGroup,
+        shot_id: shotId
       });
+
+      if (!item.finished_at) {
+        finishItem(item, {
+          stage: item.image_url ? "completed" : "completed_with_errors",
+          stage_message: item.image_url ? "completed" : item.fail_reason || "completed with errors"
+        });
+      }
+
+      if (item.fail_reason) {
+        bumpJob(jobId, {
+          failed_count: 1,
+          timeout_count: item.fail_reason === "Job timeout" ? 1 : 0
+        });
+        setJob(jobId, {
+          last_error_code: item.fail_reason === "Job timeout" ? "timeout" : "shot_failed",
+          last_error_message: item.fail_reason,
+          items
+        });
+      } else {
+        bumpJob(jobId, { success_count: 1 });
+        setJob(jobId, { items });
+      }
     } catch (err) {
+      const errorMessage = String(err?.message || err);
       const score = scoreItem({ shot_task: shot, success: false });
 
-      items.push({
-        image_url: "",
+      Object.assign(item, {
+        image_url: item.image_url || "",
         shot_id: shotId,
         shot_group: shotGroup,
         ...score,
-        fail_reason: String(err?.message || err),
+        fail_reason: item.fail_reason || errorMessage,
         prompt_text: promptText,
         shot_goal: shotGoal,
         priority
+      });
+
+      if (!item.finished_at) {
+        finishItem(item, {
+          stage: item.stage || "failed",
+          stage_message: item.stage_message || errorMessage,
+          fail_reason: item.fail_reason || errorMessage
+        });
+      }
+
+      bumpJob(jobId, {
+        failed_count: 1,
+        timeout_count: (item.fail_reason || errorMessage) === "Job timeout" ? 1 : 0
+      });
+
+      setJob(jobId, {
+        last_error_code: (item.fail_reason || errorMessage) === "Job timeout" ? "timeout" : "shot_failed",
+        last_error_message: item.fail_reason || errorMessage,
+        items
       });
     }
 
     setJob(jobId, {
       status: "running",
+      bridge_stage: "batch_running",
       progress_total: shotTasks.length,
       progress_done: i + 1,
-      progress_text: `done ${shotId}`
+      progress_text: `done ${shotId}`,
+      items
     });
   }
 
@@ -657,34 +1054,6 @@ async function runBatch16Internal(body, jobId) {
     product_profile: safeBody.product_profile || {}
   };
 }
-
-function makeJobId() {
-  return `job_${Date.now()}_${randomUUID().slice(0, 8)}`;
-}
-
-function setJob(jobId, patch) {
-  const prev = batch16Jobs.get(jobId) || {};
-  const next = {
-    ...prev,
-    ...patch,
-    updated_at: new Date().toISOString(),
-    updated_at_ms: Date.now()
-  };
-  batch16Jobs.set(jobId, next);
-  return next;
-}
-
-function cleanupOldJobs() {
-  const now = Date.now();
-  for (const [jobId, job] of batch16Jobs.entries()) {
-    const updatedAtMs = Number(job?.updated_at_ms || 0);
-    if (updatedAtMs && now - updatedAtMs > BATCH_JOB_TTL_MS) {
-      batch16Jobs.delete(jobId);
-    }
-  }
-}
-
-setInterval(cleanupOldJobs, 10 * 60 * 1000).unref();
 
 async function detectProductProfileFromImages({ img_urls, normalized_request }) {
   if (!OPENAI_API_KEY) {
@@ -962,18 +1331,37 @@ app.post("/run_batch16", async (req, res) => {
       ok: true,
       job_id: jobId,
       status: "queued",
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
+      bridge_stage: "queued",
+      created_at: nowIso(),
+      updated_at: nowIso(),
       updated_at_ms: Date.now(),
+
+      batch_started_at: "",
+      batch_finished_at: "",
+      batch_duration_ms: 0,
+
       progress_total: shotTasks.length,
       progress_done: 0,
       progress_text: "queued",
+
+      submit_count: 0,
+      success_count: 0,
+      failed_count: 0,
+      timeout_count: 0,
+      last_error_code: "",
+      last_error_message: "",
+
       items: [],
       top12_items: [],
       drop4_items: [],
       summary_text: "",
       product_profile: body.product_profile || {},
       error: ""
+    });
+
+    stageLog("job_start", {
+      job_id: jobId,
+      shot_count: shotTasks.length
     });
 
     res.status(202).json({
@@ -983,17 +1371,27 @@ app.post("/run_batch16", async (req, res) => {
     });
 
     setImmediate(async () => {
+      const batchStartedAtMs = Date.now();
+      const batchStartedAt = nowIso();
+
       try {
         setJob(jobId, {
           status: "running",
+          bridge_stage: "running",
+          batch_started_at: batchStartedAt,
           progress_text: "starting"
         });
 
         const result = await runBatch16Internal(body, jobId);
+        const currentJob = getJob(jobId) || {};
+        const failedCount = Number(currentJob.failed_count || 0);
 
         setJob(jobId, {
           ok: true,
           status: "done",
+          bridge_stage: failedCount > 0 ? "completed_with_errors" : "completed_ok",
+          batch_finished_at: nowIso(),
+          batch_duration_ms: Date.now() - batchStartedAtMs,
           progress_done: shotTasks.length,
           progress_total: shotTasks.length,
           progress_text: "done",
@@ -1004,11 +1402,31 @@ app.post("/run_batch16", async (req, res) => {
           product_profile: result.product_profile || body.product_profile || {},
           error: ""
         });
+
+        const doneJob = getJob(jobId) || {};
+        stageLog("job_finish", {
+          job_id: jobId,
+          bridge_stage: doneJob.bridge_stage || "",
+          batch_duration_ms: Number(doneJob.batch_duration_ms || 0),
+          success_count: Number(doneJob.success_count || 0),
+          failed_count: Number(doneJob.failed_count || 0),
+          timeout_count: Number(doneJob.timeout_count || 0)
+        });
       } catch (err) {
         setJob(jobId, {
           ok: false,
           status: "failed",
+          bridge_stage: "failed",
+          batch_finished_at: nowIso(),
+          batch_duration_ms: Date.now() - batchStartedAtMs,
           progress_text: "failed",
+          error: String(err?.message || err),
+          last_error_code: "job_failed",
+          last_error_message: String(err?.message || err)
+        });
+
+        stageLog("job_fail", {
+          job_id: jobId,
           error: String(err?.message || err)
         });
       }
@@ -1040,42 +1458,7 @@ app.get("/run_batch16_status", async (req, res) => {
       });
     }
 
-    if (job.status === "done") {
-      return res.json({
-        ok: true,
-        job_id: jobId,
-        status: "done",
-        progress_done: Number(job.progress_done || 0),
-        progress_total: Number(job.progress_total || 0),
-        progress_text: job.progress_text || "",
-        items: Array.isArray(job.items) ? job.items : [],
-        top12_items: Array.isArray(job.top12_items) ? job.top12_items : [],
-        drop4_items: Array.isArray(job.drop4_items) ? job.drop4_items : [],
-        summary_text: job.summary_text || "",
-        product_profile: job.product_profile || {}
-      });
-    }
-
-    if (job.status === "failed") {
-      return res.json({
-        ok: false,
-        job_id: jobId,
-        status: "failed",
-        progress_done: Number(job.progress_done || 0),
-        progress_total: Number(job.progress_total || 0),
-        progress_text: job.progress_text || "",
-        error: job.error || "unknown error"
-      });
-    }
-
-    return res.json({
-      ok: true,
-      job_id: jobId,
-      status: job.status || "queued",
-      progress_done: Number(job.progress_done || 0),
-      progress_total: Number(job.progress_total || 0),
-      progress_text: job.progress_text || ""
-    });
+    return res.json(serializeJob(jobId, job));
   } catch (err) {
     res.status(500).json({ ok: false, error: String(err.message || err) });
   }
