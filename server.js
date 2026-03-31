@@ -80,7 +80,7 @@ const PUBLIC_BASE_URL =
     : `http://localhost:${PORT}`);
 
 const COMFY_CKPT_NAME =
-  process.env.COMFY_CKPT_NAME || "v2-1768-ema-pruned.safetensors";
+  process.env.COMFY_CKPT_NAME || "v2-1_768-ema-pruned.safetensors";
 
 const WORKFLOW_TEMPLATE = resolveImg2ImgWorkflowPath();
 
@@ -267,6 +267,37 @@ async function submitWorkflow(workflow) {
   return data.prompt_id;
 }
 
+async function fetchOutputs(promptId) {
+  const res = await fetch(`${BASE_URL}/api/history_v2/${promptId}`, {
+    headers: getHeaders(false)
+  });
+
+  if (!res.ok) {
+    throw new Error(`History failed: HTTP ${res.status}`);
+  }
+
+  const data = await res.json();
+  return data.outputs || {};
+}
+
+function firstImageFile(outputs) {
+  for (const nodeOutputs of Object.values(outputs || {})) {
+    const images = nodeOutputs?.images || [];
+    if (images.length) return images[0];
+  }
+  return null;
+}
+
+function buildProxyUrl(fileInfo) {
+  const params = new URLSearchParams({
+    filename: fileInfo.filename,
+    subfolder: fileInfo.subfolder || "",
+    type: fileInfo.type || "output"
+  });
+
+  return `${PUBLIC_BASE_URL}/output_proxy?${params.toString()}`;
+}
+
 function makeJobId() {
   return `job_${Date.now()}_${randomUUID().slice(0, 8)}`;
 }
@@ -328,6 +359,25 @@ function finishItem(item, patch = {}) {
   return item;
 }
 
+function getShotGroup(shot_task) {
+  return (
+    shot_task?.shot_group ||
+    shot_task?.group ||
+    shot_task?.shot_type ||
+    "wildcard"
+  );
+}
+
+function getShotGoal(shot_task) {
+  return (
+    shot_task?.shot_goal ||
+    shot_task?.goal ||
+    shot_task?.purpose ||
+    shot_task?.brief ||
+    ""
+  );
+}
+
 function createBatchItem(shot, index) {
   const shotId = shot?.shot_id || `shot_${String(index + 1).padStart(3, "0")}`;
   return {
@@ -349,11 +399,12 @@ function createBatchItem(shot, index) {
     output_fetch_ok: false,
     proxy_write_ok: false,
     duration_ms: 0,
-    started_at: nowIso(),
+    started_at: "",
     finished_at: "",
     updated_at: nowIso(),
 
-    _src_index: index
+    _src_index: index,
+    file_info: null
   };
 }
 
@@ -420,25 +471,6 @@ function serializeJob(jobId, job) {
     summary_text: job?.summary_text || "",
     product_profile: job?.product_profile || {}
   };
-}
-
-function getShotGroup(shot_task) {
-  return (
-    shot_task?.shot_group ||
-    shot_task?.group ||
-    shot_task?.shot_type ||
-    "wildcard"
-  );
-}
-
-function getShotGoal(shot_task) {
-  return (
-    shot_task?.shot_goal ||
-    shot_task?.goal ||
-    shot_task?.purpose ||
-    shot_task?.brief ||
-    ""
-  );
 }
 
 function compilePrompt({ product_profile, style_strategy, global_style_line, shot_task }) {
@@ -553,6 +585,10 @@ function pickTop12(items, finalCount = 12) {
   };
 }
 
+function buildSummaryText(items, top12_items) {
+  return `已生成 ${items.length} 张候选图，筛选出 ${top12_items.length} 张结果。`;
+}
+
 function extractImgUrls(body) {
   if (Array.isArray(body?.img_urls) && body.img_urls.length) {
     return body.img_urls;
@@ -604,13 +640,14 @@ async function waitForCompletion(promptId, timeoutMs = SINGLE_JOB_TIMEOUT_MS, ct
 
     if (status && status !== lastState) {
       lastState = status;
+
       if (item) {
         touchItem(item, {
           stage: "polling",
           stage_message: `poll_state=${status}`
         });
       }
-      if (jobId) setJob(jobId, {});
+
       stageLog("poll_state", {
         job_id: jobId,
         shot_id: item?.shot_id || "",
@@ -619,16 +656,30 @@ async function waitForCompletion(promptId, timeoutMs = SINGLE_JOB_TIMEOUT_MS, ct
       });
     }
 
-    if (status === "completed") return true;
+    if (status === "completed") {
+      return true;
+    }
 
-    if (status === "failed" || status === "cancelled") {
+    if (
+      status === "failed" ||
+      status === "cancelled" ||
+      status === "error"
+    ) {
       if (item) {
-        touchItem(item, {
+        finishItem(item, {
           stage: "poll_failed",
           stage_message: `job ${status}`,
           fail_reason: `Job ${status}`
         });
       }
+
+      stageLog("poll_fail", {
+        job_id: jobId,
+        shot_id: item?.shot_id || "",
+        comfy_job_id: item?.comfy_job_id || promptId,
+        state: status
+      });
+
       throw new Error(`Job ${status}`);
     }
 
@@ -647,42 +698,10 @@ async function waitForCompletion(promptId, timeoutMs = SINGLE_JOB_TIMEOUT_MS, ct
     job_id: jobId,
     shot_id: item?.shot_id || "",
     comfy_job_id: item?.comfy_job_id || promptId,
-    stage: item?.stage || "timeout",
-    duration_ms: Number(item?.duration_ms || Date.now() - started)
+    duration_ms: Number(item?.duration_ms || 0)
   });
 
   throw new Error("Job timeout");
-}
-
-async function fetchOutputs(promptId) {
-  const res = await fetch(`${BASE_URL}/api/history_v2/${promptId}`, {
-    headers: getHeaders(false)
-  });
-
-  if (!res.ok) {
-    throw new Error(`History failed: HTTP ${res.status}`);
-  }
-
-  const data = await res.json();
-  return data.outputs || {};
-}
-
-function firstImageFile(outputs) {
-  for (const nodeOutputs of Object.values(outputs || {})) {
-    const images = nodeOutputs?.images || [];
-    if (images.length) return images[0];
-  }
-  return null;
-}
-
-function buildProxyUrl(fileInfo) {
-  const params = new URLSearchParams({
-    filename: fileInfo.filename,
-    subfolder: fileInfo.subfolder || "",
-    type: fileInfo.type || "output"
-  });
-
-  return `${PUBLIC_BASE_URL}/output_proxy?${params.toString()}`;
 }
 
 async function generateOneInternal(body, ctx = {}) {
@@ -703,7 +722,7 @@ async function generateOneInternal(body, ctx = {}) {
       stage_message: "uploading input image"
     });
   }
-  if (jobId) setJob(jobId, {});
+
   stageLog("upload_begin", {
     job_id: jobId,
     shot_id: shotId
@@ -727,7 +746,7 @@ async function generateOneInternal(body, ctx = {}) {
       stage_message: "input image uploaded"
     });
   }
-  if (jobId) setJob(jobId, {});
+
   stageLog("upload_ok", {
     job_id: jobId,
     shot_id: shotId,
@@ -749,14 +768,16 @@ async function generateOneInternal(body, ctx = {}) {
 
   if (item) {
     touchItem(item, {
+      started_at: item.started_at || nowIso(),
       stage: "submit_begin",
       stage_message: "submitting workflow to comfy"
     });
   }
-  if (jobId) setJob(jobId, {});
+
   stageLog("submit_begin", {
     job_id: jobId,
-    shot_id: shotId
+    shot_id: shotId,
+    ckpt_name: body.ckpt_name || COMFY_CKPT_NAME
   });
 
   const promptId = await submitWorkflow(workflow);
@@ -768,9 +789,9 @@ async function generateOneInternal(body, ctx = {}) {
       stage_message: "submitted to comfy"
     });
   }
-  if (jobId) {
-    bumpJob(jobId, { submit_count: 1 });
-  }
+
+  bumpJob(jobId, { submit_count: 1 });
+
   stageLog("submit_ok", {
     job_id: jobId,
     shot_id: shotId,
@@ -788,7 +809,7 @@ async function generateOneInternal(body, ctx = {}) {
       stage_message: "fetching comfy output"
     });
   }
-  if (jobId) setJob(jobId, {});
+
   stageLog("output_fetch_begin", {
     job_id: jobId,
     shot_id: shotId,
@@ -805,7 +826,7 @@ async function generateOneInternal(body, ctx = {}) {
       stage_message: fileInfo ? "comfy output fetched" : "no image output found"
     });
   }
-  if (jobId) setJob(jobId, {});
+
   stageLog("output_fetch_ok", {
     job_id: jobId,
     shot_id: shotId,
@@ -830,7 +851,7 @@ async function generateOneInternal(body, ctx = {}) {
       stage_message: "writing image_url"
     });
   }
-  if (jobId) setJob(jobId, {});
+
   stageLog("image_url_write_begin", {
     job_id: jobId,
     shot_id: shotId
@@ -845,12 +866,13 @@ async function generateOneInternal(body, ctx = {}) {
       stage: "completed",
       stage_message: imageUrl ? "image_url written" : "image_url empty"
     });
+
     finishItem(item, {
       fail_reason: "",
       file_info: fileInfo
     });
   }
-  if (jobId) setJob(jobId, {});
+
   stageLog("image_url_write_ok", {
     job_id: jobId,
     shot_id: shotId,
@@ -865,10 +887,6 @@ async function generateOneInternal(body, ctx = {}) {
     prompt_text: body.prompt_text,
     file_info: fileInfo
   };
-}
-
-function buildSummaryText(items, top12_items) {
-  return `已生成 ${items.length} 张候选图，筛选出 ${top12_items.length} 张结果。`;
 }
 
 async function runBatch16Internal(body, jobId) {
@@ -953,7 +971,7 @@ async function runBatch16Internal(body, jobId) {
           cfg: shot?.cfg ?? safeBody.cfg ?? 6.5,
           denoise: shot?.denoise ?? safeBody.denoise ?? 0.55,
           seed: shot?.seed ?? (baseSeed + i),
-          ckpt_name: shot?.ckpt_name ?? safeBody.ckpt_name,
+          ckpt_name: shot?.ckpt_name ?? safeBody.ckpt_name ?? COMFY_CKPT_NAME,
           priority
         },
         { jobId, item }
@@ -976,7 +994,9 @@ async function runBatch16Internal(body, jobId) {
       if (!item.finished_at) {
         finishItem(item, {
           stage: item.image_url ? "completed" : "completed_with_errors",
-          stage_message: item.image_url ? "completed" : item.fail_reason || "completed with errors"
+          stage_message: item.image_url
+            ? "completed"
+            : item.fail_reason || "completed with errors"
         });
       }
 
@@ -985,6 +1005,7 @@ async function runBatch16Internal(body, jobId) {
           failed_count: 1,
           timeout_count: item.fail_reason === "Job timeout" ? 1 : 0
         });
+
         setJob(jobId, {
           last_error_code: item.fail_reason === "Job timeout" ? "timeout" : "shot_failed",
           last_error_message: item.fail_reason,
@@ -1023,9 +1044,16 @@ async function runBatch16Internal(body, jobId) {
       });
 
       setJob(jobId, {
-        last_error_code: (item.fail_reason || errorMessage) === "Job timeout" ? "timeout" : "shot_failed",
+        last_error_code:
+          (item.fail_reason || errorMessage) === "Job timeout" ? "timeout" : "shot_failed",
         last_error_message: item.fail_reason || errorMessage,
         items
+      });
+
+      stageLog("shot_fail", {
+        job_id: jobId,
+        shot_id: shotId,
+        error: item.fail_reason || errorMessage
       });
     }
 
@@ -1247,7 +1275,8 @@ app.get("/health", async (_req, res) => {
     service: "coze-comfy-bridge",
     base_url: BASE_URL,
     vision_model: OPENAI_VISION_MODEL,
-    workflow_template: WORKFLOW_TEMPLATE
+    workflow_template: WORKFLOW_TEMPLATE,
+    comfy_ckpt_name: COMFY_CKPT_NAME
   });
 });
 
@@ -1361,7 +1390,8 @@ app.post("/run_batch16", async (req, res) => {
 
     stageLog("job_start", {
       job_id: jobId,
-      shot_count: shotTasks.length
+      shot_count: shotTasks.length,
+      ckpt_name: body.ckpt_name || COMFY_CKPT_NAME
     });
 
     res.status(202).json({
@@ -1372,13 +1402,12 @@ app.post("/run_batch16", async (req, res) => {
 
     setImmediate(async () => {
       const batchStartedAtMs = Date.now();
-      const batchStartedAt = nowIso();
 
       try {
         setJob(jobId, {
           status: "running",
           bridge_stage: "running",
-          batch_started_at: batchStartedAt,
+          batch_started_at: nowIso(),
           progress_text: "starting"
         });
 
@@ -1489,4 +1518,5 @@ app.post("/detect_profile", async (req, res) => {
 app.listen(PORT, () => {
   console.log(`Bridge listening on :${PORT}`);
   console.log(`Using workflow template: ${WORKFLOW_TEMPLATE}`);
+  console.log(`Using COMFY_CKPT_NAME: ${COMFY_CKPT_NAME}`);
 });
