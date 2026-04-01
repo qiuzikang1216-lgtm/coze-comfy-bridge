@@ -201,6 +201,30 @@ function patchWorkflow(workflow, params) {
   return next;
 }
 
+function extractComfyStatus(data) {
+  return String(
+    data?.status ??
+      data?.state ??
+      data?.job?.status ??
+      data?.job?.state ??
+      data?.data?.status ??
+      data?.data?.state ??
+      ""
+  )
+    .trim()
+    .toLowerCase();
+}
+
+function isComfySuccessStatus(status) {
+  const s = String(status || "").trim().toLowerCase();
+  return s === "completed" || s === "success";
+}
+
+function isComfyFailedStatus(status) {
+  const s = String(status || "").trim().toLowerCase();
+  return s === "failed" || s === "cancelled" || s === "error";
+}
+
 async function downloadUrlToBlob(url) {
   const res = await fetch(url);
 
@@ -277,7 +301,13 @@ async function fetchOutputs(promptId) {
   }
 
   const data = await res.json();
-  return data.outputs || {};
+
+  return (
+    data?.outputs ||
+    data?.data?.outputs ||
+    data?.history?.outputs ||
+    {}
+  );
 }
 
 function firstImageFile(outputs) {
@@ -286,6 +316,46 @@ function firstImageFile(outputs) {
     if (images.length) return images[0];
   }
   return null;
+}
+
+async function fetchOutputsWithRetry(promptId, options = {}) {
+  const attempts = Math.max(1, Number(options.attempts || 8));
+  const intervalMs = Math.max(200, Number(options.intervalMs || 1500));
+
+  let lastOutputs = {};
+  let lastError = null;
+
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const outputs = await fetchOutputs(promptId);
+      lastOutputs = outputs || {};
+
+      const fileInfo = firstImageFile(lastOutputs);
+      if (fileInfo) {
+        return {
+          outputs: lastOutputs,
+          fileInfo,
+          attempts_used: i + 1
+        };
+      }
+    } catch (err) {
+      lastError = err;
+    }
+
+    if (i < attempts - 1) {
+      await sleep(intervalMs);
+    }
+  }
+
+  if (lastError && !firstImageFile(lastOutputs)) {
+    throw lastError;
+  }
+
+  return {
+    outputs: lastOutputs || {},
+    fileInfo: firstImageFile(lastOutputs),
+    attempts_used: attempts
+  };
 }
 
 function buildProxyUrl(fileInfo) {
@@ -636,7 +706,7 @@ async function waitForCompletion(promptId, timeoutMs = SINGLE_JOB_TIMEOUT_MS, ct
     }
 
     const data = await res.json();
-    const status = String(data.status || "").toLowerCase();
+    const status = extractComfyStatus(data);
 
     if (status && status !== lastState) {
       lastState = status;
@@ -656,15 +726,11 @@ async function waitForCompletion(promptId, timeoutMs = SINGLE_JOB_TIMEOUT_MS, ct
       });
     }
 
-    if (status === "completed") {
+    if (isComfySuccessStatus(status)) {
       return true;
     }
 
-    if (
-      status === "failed" ||
-      status === "cancelled" ||
-      status === "error"
-    ) {
+    if (isComfyFailedStatus(status)) {
       if (item) {
         finishItem(item, {
           stage: "poll_failed",
@@ -816,14 +882,21 @@ async function generateOneInternal(body, ctx = {}) {
     comfy_job_id: promptId
   });
 
-  const outputs = await fetchOutputs(promptId);
-  const fileInfo = firstImageFile(outputs);
+  const outputResult = await fetchOutputsWithRetry(promptId, {
+    attempts: 8,
+    intervalMs: 1500
+  });
+
+  const outputs = outputResult.outputs || {};
+  const fileInfo = outputResult.fileInfo || null;
 
   if (item) {
     touchItem(item, {
-      output_fetch_ok: true,
-      stage: "output_fetch_ok",
-      stage_message: fileInfo ? "comfy output fetched" : "no image output found"
+      output_fetch_ok: !!fileInfo,
+      stage: fileInfo ? "output_fetch_ok" : "output_fetch_empty",
+      stage_message: fileInfo
+        ? `comfy output fetched after ${outputResult.attempts_used} attempt(s)`
+        : "no image output found"
     });
   }
 
@@ -831,7 +904,8 @@ async function generateOneInternal(body, ctx = {}) {
     job_id: jobId,
     shot_id: shotId,
     comfy_job_id: promptId,
-    has_output: !!fileInfo
+    has_output: !!fileInfo,
+    attempts_used: Number(outputResult.attempts_used || 0)
   });
 
   if (!fileInfo) {
